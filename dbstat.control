@@ -1,0 +1,6 @@
+comment = 'DB Statistics Collector'
+default_version = '0.1'
+relocatable = false
+superuser = true
+requires = 'plpgsql'
+schema = 'dbstat'
