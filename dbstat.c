@@ -12,16 +12,21 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <time.h>
 
-char * parse_args( int, char ** );
-void _handle_modification( PGconn *, char *, char * );
+void parse_args( int, char ** );
+void _handle_modification( char *, char * );
+PGresult * _execute_query( char *, char **, int );
+
+/* Connection globals */
+PGconn * conn;
+char * conninfo = NULL;
 
 int DEBUG = 0;
 
-char * parse_args( int argc, char ** argv )
+void parse_args( int argc, char ** argv )
 {
     /* Parse command line arguments */
-    char * conninfo = NULL;
     char * username = NULL;
     char * dbname   = NULL;
     char * port     = NULL;
@@ -103,59 +108,144 @@ char * parse_args( int argc, char ** argv )
     strcat( conninfo, " dbname=" );
     strcat( conninfo, dbname );
 
-    return conninfo;
+    if( DEBUG )
+    {
+        fprintf(
+            stdout,
+            "Parsed args: %s\n",
+            conninfo
+        );
+    }
+
+    return;
 }
 
-void _handle_modification( PGconn * conn, char * channel, char * operation )
+/*
+ *  _execute_query( query, params )
+ *
+ *  Validates a connection, executes a query, and returns the result
+ */
+PGresult * _execute_query( char * query, char ** params, int param_count )
 {
-    char * command;
-    int malloc_size = 0;
     PGresult * result;
-    char * row_delta;
-    char * zero = "0"; 
-    char * positive_one = "1";
-    char * negative_one = "-1";
-    
-    row_delta = zero;
-    /*
-     *  INSERT INTO dbstat.tb_catalog_table_modification( oid, op, recorded ) 70
-     *       SELECT c.oid, ?::CHAR, clock_timestamp() 40 (doesnt include '' around ?
-     *         FROM pg_class c 16
-     *         JOIN pg_namespace n 20
-     *           ON n.oid = c.relnamespace 26
-     *         JOIN dbstat.tb_catalog_table ct 32
-     *           ON ct.oid = c.oid 18
-     *        WHERE ct.schema_name || '.' || ct.table_name = ? 47 (not including '' around ? )
-     */
-    /* We'll need characters + variables malloced */
-    malloc_size = strlen( channel )
-                + strlen( operation )
-                + 273;
-    
-    command = ( char * ) malloc( sizeof( char ) * malloc_size );
-    
-    if( command == NULL )
+    int retry_counter = 0;
+    int last_backoff_time = 0;
+    char * last_sql_state = NULL;
+
+    while( PQstatus( conn ) != CONNECTION_OK && retry_counter < 3 )
     {
         fprintf(
             stderr,
-            "Malloc for stat logging failed!\n"
+            "Failed to connect to DB server (%s). Retrying...\n",
+            PQerrorMessage( conn )
         );
-        return;
+
+        retry_counter++;
+        last_backoff_time = (int) ( rand() / 1000 ) + last_backoff_time;
+        PQfinish( conn );
+        sleep( last_backoff_time );
+
+        conn = PQconnectdb( conninfo );
     }
 
-    strcpy( command, "INSERT INTO dbstat.tb_catalog_table_modification( oid, op, recorded ) " );
-    strcat( command, "SELECT c.oid, '" );
-    strcat( command, operation );
-    strcat( command, "'::CHAR, clock_timestamp() " );
-    strcat( command, "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace " );
-    strcat( command, "JOIN dbstat.tb_catalog_table ct ON ct.oid = c.oid " );
-    strcat( command, "WHERE ct.schema_name || '.' || ct.table_name = '" );
-    strcat( command, channel );
-    strcat( command, "'\0" );
+    while(
+            (
+                last_sql_state == NULL // Not inited (first run)
+             || strcmp( last_sql_state, "57P01" ) == 0 // Terminated by Admin
+             || strcmp( last_sql_state, "57014" ) == 0 // Canceled
+            )
+         && retry_counter < 3
+         )
+    {
+        if( params == NULL )
+        {
+            result = PQexec( conn, query );
+        }
+        else
+        {
+            if( DEBUG )
+            {
+                printf( "execing params\n" );
+            }
 
-    result = PQexec( conn, command );
+            result = PQexecParams(
+                conn,
+                query,
+                param_count,
+                NULL,
+                ( const char * const * ) params,
+                NULL,
+                NULL,
+                1
+            );
+        }
 
-    if( PQresultStatus( result ) != PGRES_COMMAND_OK )
+        if( !( PQresultStatus( result ) == PGRES_COMMAND_OK || PQresultStatus( result ) == PGRES_TUPLES_OK ) )
+        {
+            fprintf(
+                stderr,
+                "Query failed: %s\n",
+                PQerrorMessage( conn )
+            );
+
+            last_sql_state = PQresultErrorField( result, PG_DIAG_SQLSTATE );
+
+            PQclear( result );
+
+            retry_counter++;
+        }
+        else
+        {
+            return result;
+        }
+    }
+
+    if( retry_counter == 3 )
+    {
+        fprintf(
+            stderr,
+            "Query failed after 3 tries.\n"
+        );
+    }
+
+    return NULL;
+}
+
+void _handle_modification( char * channel, char * operation )
+{
+    PGresult * result;
+    char * row_delta;
+    char * zero = "0";
+    char * positive_one = "1";
+    char * negative_one = "-1";
+    char * params[2];
+    char * log_modification =
+        "INSERT INTO dbstat.tb_catalog_table_modification "
+        "            ( "
+        "                oid, "
+        "                op, "
+        "                recorded "
+        "            ) "
+        "     SELECT c.oid, "
+        "            $1::CHAR, "
+        "            clock_timestamp() "
+        "       FROM pg_class c "
+        "       JOIN pg_namespace n "
+        "         ON n.oid = c.relnamespace "
+        "       JOIN dbstat.tb_catalog_table ct "
+        "         ON ct.oid = c.oid "
+        "      WHERE ct.schema_name || '.' || ct.table_name = $2";
+    char * update_stats =
+        " UPDATE dbstat.tb_catalog_table "
+        "    SET row_count = row_count + $1 "
+        "  WHERE schema_name || '.' || table_name = $2 ";
+
+    row_delta = zero;
+    params[0] = operation;
+    params[1] = channel;
+    result = _execute_query( log_modification, params, 2 );
+
+    if( result == NULL )
     {
         fprintf(
             stderr,
@@ -163,15 +253,10 @@ void _handle_modification( PGconn * conn, char * channel, char * operation )
             PQerrorMessage( conn )
         );
 
-        PQclear( result );
-        PQfinish( conn );
-        free( command );
         return;
     }
-    
+
     PQclear( result );
-    free( command );
-    malloc_size = 0;
 
     if( strcmp( operation, "DELETE" ) == 0 )
     {
@@ -182,52 +267,27 @@ void _handle_modification( PGconn * conn, char * channel, char * operation )
         row_delta = positive_one;
     }
 
-    /* UPDATE dbstat.tb_catalog_table SET row_count = row_count + ? WHERE schema_name || '.' || table_name = '?' */
-    /* need to malloc 97 chars */
-    malloc_size = strlen( channel )
-                + strlen( row_delta )
-                + 104;
-    
-    command = ( char * ) malloc( sizeof( char ) * malloc_size );
-    
-    if( command == NULL )
+    params[0] = row_delta;
+    params[1] = channel;
+    result = _execute_query( update_stats, params, 2 );
+
+    if( result == NULL )
     {
         fprintf(
             stderr,
-            "Failed to malloc row count update command!\n"
-        );
-    }
-
-    strcpy( command, "UPDATE dbstat.tb_catalog_table SET row_count = row_count + " );
-    strcat( command, row_delta );
-    strcat( command, " WHERE schema_name || '.' || table_name = '" );
-    strcat( command, channel );
-    strcat( command, "'\0" );
-
-    result = PQexec( conn, command );
-
-    if( PQresultStatus( result ) != PGRES_COMMAND_OK )
-    {
-        fprintf(
-            stderr,
-            "UPDATE of row_count failed: %s",
+            "UPDATE of row counts failed: %s\n",
             PQerrorMessage( conn )
         );
 
-        PQclear( result );
-        PQfinish( conn );
-        free( command );
         return;
     }
 
-    free( command );
+    PQclear( result );
     return;
 }
 
 int main( int argc, char ** argv )
 {
-    char * conninfo;
-    PGconn * conn;
     int notify_count;
     PGnotify * notify;
     PGresult * result;
@@ -239,16 +299,20 @@ int main( int argc, char ** argv )
     char * schema_name;
     char * table_name;
 
-    conninfo = parse_args( argc, argv );
+    srand( 8675309 * time( 0 ) );
+    parse_args( argc, argv );
 
     if( conninfo == NULL )
     {
+        fprintf(
+            stderr,
+            "No way to connect to DB!\n"
+        );
         return 1;
     }
 
     /* Connect to the database */
     conn = PQconnectdb( conninfo );
-    free( conninfo );
 
     if( PQstatus( conn ) != CONNECTION_OK )
     {
@@ -268,9 +332,10 @@ int main( int argc, char ** argv )
     }
 
     /* Enumerate the channels we should be listening on */
-    result = PQexec(
-        conn,
-        "SELECT schema_name, table_name FROM dbstat.tb_catalog_table ORDER BY table_name"
+    result = _execute_query(
+        "SELECT schema_name, table_name FROM dbstat.tb_catalog_table ORDER BY table_name",
+        NULL,
+        0
     );
 
     if( PQresultStatus( result ) != PGRES_TUPLES_OK )
@@ -323,7 +388,7 @@ int main( int argc, char ** argv )
         strcat( listen_command, table_name );
         strcat( listen_command, "\"\0" );
 
-        listen_result = PQexec( conn, listen_command );
+        listen_result = _execute_query( listen_command, NULL, 0 );
 
         if( PQresultStatus( listen_result ) != PGRES_COMMAND_OK )
         {
@@ -395,7 +460,7 @@ int main( int argc, char ** argv )
                 );
             }
 
-            _handle_modification( conn, relname, operation );
+            _handle_modification( relname, operation );
             PQfreemem( notify );
             notify_count++;
         }
