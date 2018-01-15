@@ -1,5 +1,11 @@
 /*
  * DBStat - Written Jan 2018 by Chris Autry
+ *
+ * TODO:
+ *  - Enable dbstat to connect to a foreign database for logging table statistics
+ *  - Enable more detailed logging, like row diffs for UPDATES and PKs for INS/DEL
+ *  - Enable multithreading for listen channels?
+ *  - Clean up main() by pulling code into functions
  */
 
 #include <stdio.h>
@@ -14,15 +20,38 @@
 #include <sys/types.h>
 #include <time.h>
 
+/* Function prototypes */
 void parse_args( int, char ** );
 void _handle_modification( char *, char * );
 PGresult * _execute_query( char *, char **, int );
+void usage( char * );
 
-/* Connection globals */
+/* Program globals */
 PGconn * conn;
 char * conninfo = NULL;
-
 int DEBUG = 0;
+
+/* Functions */
+void usage( char * message )
+{
+    if( message != NULL )
+    {
+        printf( "%s\n", message );
+    }
+
+    printf(
+        "Usage: dbstat\n"
+        "    -U DB user (default: postgres)\n"
+        "    -p DB port (default: 5432)\n"
+        "    -h DB host (default: localhost)\n"
+        "    -d DB name (default: -U param )\n"
+        "    -D DEBUG\n"
+        "    -v VERSION\n"
+        "    -? HELP\n"
+   );
+
+   exit( 1 );
+}
 
 void parse_args( int argc, char ** argv )
 {
@@ -37,7 +66,7 @@ void parse_args( int argc, char ** argv )
 
     opterr = 0;
 
-    while( ( c = getopt( argc, argv, "U:p:d:h:D" ) ) != -1 )
+    while( ( c = getopt( argc, argv, "U:p:d:h:Dv" ) ) != -1 )
     {
         switch( c )
         {
@@ -57,9 +86,12 @@ void parse_args( int argc, char ** argv )
                 DEBUG = 1;
                 break;
             case '?':
-                break;
+                usage( NULL );
+            case 'v':
+                printf( "DB Statistics Collector. Version 0.1\n" );
+                exit( 0 );
             default:
-                printf( "Invalid argument: %c\n", (char) c );
+                usage( "Invalid argument:" );
                 exit( 1 );
         }
     }
@@ -87,7 +119,8 @@ void parse_args( int argc, char ** argv )
     /*
         malloc connection string
         accounting for
-        'username=? host=? port=? dbname=?'
+        'username=? host=? port=? dbname=?\0'
+        The ?'s are variables, and the size is accounted for
     */
     malloc_size = strlen( username )
                 + strlen( port )
@@ -180,7 +213,12 @@ PGresult * _execute_query( char * query, char ** params, int param_count )
             );
         }
 
-        if( !( PQresultStatus( result ) == PGRES_COMMAND_OK || PQresultStatus( result ) == PGRES_TUPLES_OK ) )
+        if(
+            !(
+                PQresultStatus( result ) == PGRES_COMMAND_OK ||
+                PQresultStatus( result ) == PGRES_TUPLES_OK
+             )
+          )
         {
             fprintf(
                 stderr,
@@ -204,7 +242,8 @@ PGresult * _execute_query( char * query, char ** params, int param_count )
     {
         fprintf(
             stderr,
-            "Query failed after 3 tries.\n"
+            "Query failed after %i tries.\n",
+            retry_counter
         );
     }
 
@@ -214,10 +253,7 @@ PGresult * _execute_query( char * query, char ** params, int param_count )
 void _handle_modification( char * channel, char * operation )
 {
     PGresult * result;
-    char * row_delta;
-    char * zero = "0";
-    char * positive_one = "1";
-    char * negative_one = "-1";
+    char * row_delta = "0";
     char * params[2];
     char * log_modification =
         "INSERT INTO dbstat.tb_catalog_table_modification "
@@ -240,7 +276,6 @@ void _handle_modification( char * channel, char * operation )
         "    SET row_count = row_count + $1 "
         "  WHERE schema_name || '.' || table_name = $2 ";
 
-    row_delta = zero;
     params[0] = operation;
     params[1] = channel;
     result = _execute_query( log_modification, params, 2 );
@@ -260,11 +295,11 @@ void _handle_modification( char * channel, char * operation )
 
     if( strcmp( operation, "DELETE" ) == 0 )
     {
-        row_delta = negative_one;
+        row_delta = "-1";
     }
     else if( strcmp( operation, "INSERT" ) == 0 )
     {
-        row_delta = positive_one;
+        row_delta = "1";
     }
 
     params[0] = row_delta;
@@ -288,16 +323,24 @@ void _handle_modification( char * channel, char * operation )
 
 int main( int argc, char ** argv )
 {
-    int notify_count;
     PGnotify * notify;
+
     PGresult * result;
     PGresult * listen_result;
-    int row_count = 0;
-    int i = 0;
-    int malloc_size = 0;
+
+    int notify_count = 0;
+    int row_count    = 0;
+    int i            = 0;
+    int malloc_size  = 0;
+
     char * listen_command;
     char * schema_name;
     char * table_name;
+    char * catalog_table_query =
+        "    SELECT schema_name, "
+        "           table_name "
+        "      FROM dbstat.tb_catalog_table "
+        "  ORDER BY table_name ";
 
     srand( 8675309 * time( 0 ) );
     parse_args( argc, argv );
@@ -333,7 +376,7 @@ int main( int argc, char ** argv )
 
     /* Enumerate the channels we should be listening on */
     result = _execute_query(
-        "SELECT schema_name, table_name FROM dbstat.tb_catalog_table ORDER BY table_name",
+        catalog_table_query,
         NULL,
         0
     );
@@ -413,8 +456,7 @@ int main( int argc, char ** argv )
 
     PQclear( result );
 
-    notify_count = 0;
-    notify       = NULL;
+    notify = NULL;
 
     while( 1 )
     {
