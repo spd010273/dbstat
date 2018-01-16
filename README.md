@@ -5,7 +5,7 @@ DB Statistics Collector
 
 DB Statistics Collector (dbstat) is a PostgreSQL extension that collects table metrics such as exact row count, and the timing of insert/update/delete statements.
 
-This is a learning exercise in the use of libpq and C-based extensions for me.
+This is a learning exercise in the use of libpq and C-based extensions.
 
 ## Requirements:
 
@@ -23,3 +23,15 @@ This is a learning exercise in the use of libpq and C-based extensions for me.
 6. Run 'CREATE EXTENSION dbstat;'
 7. Start dbstat with the connection parameters to the target DB server/instance.
 
+Note: You may need to symlink the libpq-fe.h file to /usr/includes. This file is typically located in:
+/usr/pgsql-version/includes/
+
+## Changelog
+
+### Version 0.2
+* Multithreaded listeners
+* SIGHUP handler reloads and reissues listeners
+* Supports NoSQL / KV store backends for statistics
+
+### Version 0.1
+Initial version

@@ -31,6 +31,27 @@ PGconn * conn;
 char * conninfo = NULL;
 int DEBUG = 0;
 
+static const char log_modification[] =
+    "INSERT INTO dbstat.tb_catalog_table_modification "
+    "            ( "
+    "                oid, "
+    "                op, "
+    "                recorded "
+    "            ) "
+    "     SELECT c.oid, "
+    "            $1::CHAR, "
+    "            clock_timestamp() "
+    "       FROM pg_class c "
+    "       JOIN pg_namespace n "
+    "         ON n.oid = c.relnamespace "
+    "       JOIN dbstat.tb_catalog_table ct "
+    "         ON ct.oid = c.oid "
+    "      WHERE ct.schema_name || '.' || ct.table_name = $2";
+static const char update_stats[] =
+    " UPDATE dbstat.tb_catalog_table "
+    "    SET row_count = row_count + $1 "
+    "  WHERE schema_name || '.' || table_name = $2 ";
+
 /* Functions */
 void usage( char * message )
 {
@@ -196,11 +217,6 @@ PGresult * _execute_query( char * query, char ** params, int param_count )
         }
         else
         {
-            if( DEBUG )
-            {
-                printf( "execing params\n" );
-            }
-
             result = PQexecParams(
                 conn,
                 query,
@@ -238,47 +254,26 @@ PGresult * _execute_query( char * query, char ** params, int param_count )
         }
     }
 
-    if( retry_counter == 3 )
-    {
-        fprintf(
-            stderr,
-            "Query failed after %i tries.\n",
-            retry_counter
-        );
-    }
+    fprintf(
+        stderr,
+        "Query failed after %i tries.\n",
+        retry_counter
+    );
 
     return NULL;
 }
 
 void _handle_modification( char * channel, char * operation )
 {
+    // TODO: Locate massive memory leak in this function
+    //  it only occurs in libpq-fe 10+
     PGresult * result;
     char * row_delta = "0";
     char * params[2];
-    char * log_modification =
-        "INSERT INTO dbstat.tb_catalog_table_modification "
-        "            ( "
-        "                oid, "
-        "                op, "
-        "                recorded "
-        "            ) "
-        "     SELECT c.oid, "
-        "            $1::CHAR, "
-        "            clock_timestamp() "
-        "       FROM pg_class c "
-        "       JOIN pg_namespace n "
-        "         ON n.oid = c.relnamespace "
-        "       JOIN dbstat.tb_catalog_table ct "
-        "         ON ct.oid = c.oid "
-        "      WHERE ct.schema_name || '.' || ct.table_name = $2";
-    char * update_stats =
-        " UPDATE dbstat.tb_catalog_table "
-        "    SET row_count = row_count + $1 "
-        "  WHERE schema_name || '.' || table_name = $2 ";
 
     params[0] = operation;
     params[1] = channel;
-    result = _execute_query( log_modification, params, 2 );
+    result = _execute_query( ( char * ) &log_modification, params, 2 );
 
     if( result == NULL )
     {
@@ -304,7 +299,7 @@ void _handle_modification( char * channel, char * operation )
 
     params[0] = row_delta;
     params[1] = channel;
-    result = _execute_query( update_stats, params, 2 );
+    result = _execute_query( ( char * ) &update_stats, params, 2 );
 
     if( result == NULL )
     {
@@ -328,7 +323,6 @@ int main( int argc, char ** argv )
     PGresult * result;
     PGresult * listen_result;
 
-    int notify_count = 0;
     int row_count    = 0;
     int i            = 0;
     int malloc_size  = 0;
@@ -483,28 +477,19 @@ int main( int argc, char ** argv )
 
         while( ( notify = PQnotifies( conn ) ) != NULL )
         {
-            char * relname;
-            int backend_pid;
-            char * operation;
-
-            relname     = notify->relname;
-            backend_pid = notify->be_pid;
-            operation   = notify->extra;
-
             if( DEBUG )
             {
                 fprintf(
-                   stderr,
+                   stdout,
                    "ASYNCRONOUS NOTIFY of '%s' received from backend PID %d with payload '%s'\n",
-                   relname,
-                   backend_pid,
-                   operation
+                   notify->relname, // Table name
+                   notify->be_pid, // Backend PID
+                   notify->extra // Operation
                 );
             }
 
-            _handle_modification( relname, operation );
+            _handle_modification( notify->relname, notify->extra );
             PQfreemem( notify );
-            notify_count++;
         }
     }
 
